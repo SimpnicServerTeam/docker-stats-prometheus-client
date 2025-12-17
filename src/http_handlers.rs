@@ -1,12 +1,19 @@
-use actix_web::{HttpResponse, Responder, Scope, get, http::header::ContentType, web::{self, Data}};
-use prometheus_client::{encoding::text, registry::Registry};
+use std::sync::Arc;
 
-use crate::{docker_stat_metrics::DockerStatContainerMetrics, usecases};
+use actix_web::{
+    HttpResponse, Responder, Scope, get,
+    http::header::ContentType,
+    web::{self, Data, Query},
+};
+use prometheus_client::encoding::text;
+use serde::Deserialize;
 
+use crate::usecases::DockerStatPollingWorker;
 
 #[derive(Debug)]
 pub struct SharedAppData {
     pub host: String,
+    pub worker: Arc<DockerStatPollingWorker>,
 }
 
 #[get("/health")]
@@ -16,47 +23,45 @@ async fn health() -> impl Responder {
 
 #[get("/docker/stats")]
 async fn get_docker_stats(app: Data<SharedAppData>) -> HttpResponse {
-    let host = &app.as_ref().host;
-    match usecases::docker_stat(host).await {
-        Ok(v) => HttpResponse::Ok()
-            .content_type(ContentType::json())
-            .body(serde_json::to_string_pretty(&v).unwrap()),
-        Err(e) => HttpResponse::InternalServerError()
-            .content_type(ContentType::plaintext())
-            .body(e.to_string()),
-    }
+    let stats = app.worker.get_last_container_stats().await;
+    HttpResponse::Ok()
+        .content_type(ContentType::json())
+        .body(serde_json::to_string(&stats).unwrap())
 }
 
 #[get("/metrics")]
 async fn get_metrics(app: Data<SharedAppData>) -> HttpResponse {
-    let host = &app.as_ref().host;
-    match usecases::docker_stat(host).await {
-        Ok(v) => {
-            let mut registry = Registry::with_prefix("container");
+    let registry = app.worker.get_last_container_stats_registry().await;
+    let mut body = String::new();
+    match text::encode(&mut body, &registry) {
+        Ok(_) => {
+            return HttpResponse::Ok()
+                .content_type("application/openmetrics-text; version=1.0.0; charset=utf-8")
+                .body(body);
+        }
+        Err(e) => {
+            return HttpResponse::InternalServerError()
+                .content_type(ContentType::plaintext())
+                .body(e.to_string());
+        }
+    }
+}
 
-            for stat in v {
-                let metrics = DockerStatContainerMetrics::new(&stat.id);
-                metrics.cpu_usage.set(stat.cpu_usage);
-                metrics.mem_usage.set(stat.mem_usage);
-                metrics.mem_limit.set(stat.mem_limit);
-                metrics.net_in.set(stat.net_in);
-                metrics.net_out.set(stat.net_out);
-                metrics.blk_in.set(stat.blk_in);
-                metrics.blk_out.set(stat.blk_out);
-                metrics.register_as_sub_registry(&mut registry, &stat.name);
-            }
+#[derive(Debug, Deserialize)]
+struct GetCgroupStatsQuery {
+    id: String,
+}
 
-            let mut body = String::new();
-            match text::encode(&mut body, &registry) {
-                Ok(_) => return HttpResponse::Ok()
-                    .content_type("application/openmetrics-text; version=1.0.0; charset=utf-8")
-                    .body(body),
-                Err(e) => return HttpResponse::InternalServerError()
-                    .content_type(ContentType::plaintext()).body(e.to_string()),
-            }
-        },
-        Err(e) => return HttpResponse::InternalServerError()
-            .content_type(ContentType::plaintext()).body(e.to_string()),
+#[get("/cgroupv2")]
+async fn get_cgroup_stats(
+    app: Data<SharedAppData>,
+    query: Query<GetCgroupStatsQuery>,
+) -> HttpResponse {
+    match app.worker.get_cgroup2_data(&query.id).await {
+        Ok(s) => HttpResponse::Ok()
+            .content_type(ContentType::json())
+            .body(serde_json::to_string(&s).unwrap()),
+        Err(_) => HttpResponse::NotFound().finish(),
     }
 }
 
@@ -65,4 +70,5 @@ pub fn get_scopes(path: &str) -> Scope {
         .service(health)
         .service(get_docker_stats)
         .service(get_metrics)
+        .service(get_cgroup_stats)
 }

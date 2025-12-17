@@ -1,23 +1,31 @@
+pub mod docker_stat_metrics;
 pub mod http_handlers;
 pub mod usecases;
-pub mod docker_stat_metrics;
 
-use std::{fs::File, io::BufReader};
+use std::{fs::File, io::BufReader, sync::Arc};
 // use rayon::prelude::*;
-use actix_web::{web::{self}, App, HttpServer};
+use actix_web::{
+    App, HttpServer,
+    web::{self},
+};
 use clap::Parser;
 use prometheus_client::metrics::gauge::Gauge;
 use tracing::level_filters::LevelFilter;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::{Layer, layer::SubscriberExt};
 
-use crate::http_handlers::SharedAppData;
+use crate::{http_handlers::SharedAppData, usecases::DockerStatPollingWorker};
 
 #[derive(Debug, clap::Parser)]
 struct CliArgs {
     /// docker host
-    /// 
-    #[arg(short = 'H', long, default_value = "unix:///var/run/docker.sock", long_help = "default value will connect to OS specific handler")]
+    ///
+    #[arg(
+        short = 'H',
+        long,
+        default_value = "unix:///var/run/docker.sock",
+        long_help = "default value will connect to OS specific handler"
+    )]
     host: String,
 
     /// HTTP bind host
@@ -45,7 +53,11 @@ pub fn test_clone_gauge() {
     let cloned_gauge = gauge.clone();
     cloned_gauge.set(5);
 
-    println!("gauge: {}, cloned_gauge: {}", gauge.get(), cloned_gauge.get());
+    println!(
+        "gauge: {}, cloned_gauge: {}",
+        gauge.get(),
+        cloned_gauge.get()
+    );
     assert!(true);
 }
 
@@ -53,25 +65,32 @@ pub fn test_clone_gauge() {
 async fn main() {
     let stdout_log = tracing_subscriber::fmt::layer().with_filter(LevelFilter::DEBUG);
 
-    let _ = tracing::subscriber::set_global_default(tracing_subscriber::Registry::default()
-        .with(stdout_log)
+    let _ = tracing::subscriber::set_global_default(
+        tracing_subscriber::Registry::default().with(stdout_log),
     );
 
     let args = CliArgs::parse();
 
+    let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(&args.host));
+    polling_stat_worker.spawn_polling_stat_task(polling_stat_worker.clone());
+
+    let docker_host_4_servr = args.host.clone();
+    let worker_4_server = polling_stat_worker.clone();
     let http_server = HttpServer::new(move || {
         App::new()
-        .app_data(web::Data::new(SharedAppData { 
-            host: args.host.to_owned(), 
-        }))
-        .wrap(TracingLogger::default())
-        .service(http_handlers::get_scopes(""))
-        
+            .app_data(web::Data::new(SharedAppData {
+                host: docker_host_4_servr.clone(),
+                worker: worker_4_server.clone(),
+            }))
+            .wrap(TracingLogger::default())
+            .service(http_handlers::get_scopes(""))
     })
     .workers(4);
 
     let server = if args.bind_secure {
-        rustls::crypto::aws_lc_rs::default_provider().install_default().unwrap();
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .unwrap();
 
         let mut certs_file = BufReader::new(File::open(args.tls_cert_path.unwrap()).unwrap());
         let mut key_file = BufReader::new(File::open(args.tls_key_path.unwrap()).unwrap());
@@ -92,12 +111,13 @@ async fn main() {
             .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key))
             .unwrap();
 
-        http_server.bind_rustls_0_23(args.bind, tls_config).unwrap().run()
-
+        http_server
+            .bind_rustls_0_23(args.bind, tls_config)
+            .unwrap()
+            .run()
     } else {
         http_server.bind(args.bind).unwrap().run()
     };
 
     let _ = tokio::spawn(server).await;
-
 }
