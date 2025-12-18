@@ -1,0 +1,30 @@
+[package]
+name = "docker-stat-prom"
+version = "0.1.0"
+edition = "2024"
+
+[profile.release]
+codegen-units = 1
+lto = "fat"
+opt-level = 3
+strip = "symbols"
+panic = "abort"
+
+[dependencies]
+prometheus-client = "0.24.0"
+actix-web = { version = "4.12", features = ["rustls-0_23", "compress-brotli"] }
+rustls = "0.23"
+rustls-pemfile = "2"
+tokio = { version = "1.48", features = ["full"] }
+clap = { version = "4.5.53", features = ["derive"] }
+tracing = { version = "0.1.43", features = ["log"] }
+tokio-rustls = "0.26.4"
+bollard = { version = "0.19.4", features = ["aws-lc-rs", "json_data_content", "webpki"] }
+uuid = { version = "1.19.0", features = ["v4", "v7"] }
+serde_json = "1.0.145"
+futures-util = "0.3.31"
+tracing-subscriber = "0.3.22"
+serde = { version = "1.0.228", features = ["derive"] }
+tracing-actix-web = { version = "0.7.20", features = ["opentelemetry_0_31"] }
+rayon = "1.11.0"
+tracing-opentelemetry = "0.32.0"
