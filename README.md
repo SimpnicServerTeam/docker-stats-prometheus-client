@@ -53,8 +53,8 @@ cgroup v2
 | container_blkio_transmit_bytes   | Gauge | Value of container write data to blkio in bytes |
 | container_network_receive_bps    | Gauge | Value of container network receive throughput in bps |
 | container_network_transmit_bps   | Gauge | Value of container network sent throughput in bps |
-| container_blkio_receive_bps      | Gauge | Value of container blkio receive throughput in byte per second |
-| container_blkio_transmit_bps     | Gauge | Value of container blkio sent throughput in byte per second |
+| container_blkio_receive_byteps   | Gauge | Value of container blkio receive throughput in byte per second |
+| container_blkio_transmit_byteps  | Gauge | Value of container blkio sent throughput in byte per second |
 
 # Note
 

@@ -74,7 +74,10 @@ async fn main() {
 
     let args = CliArgs::parse();
 
-    let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(&args.host, args.polling_millis));
+    let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(
+        &args.host,
+        args.polling_millis,
+    ));
     polling_stat_worker.spawn_polling_stat_task(polling_stat_worker.clone());
 
     let docker_host_4_servr = args.host.clone();

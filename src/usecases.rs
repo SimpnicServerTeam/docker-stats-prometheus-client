@@ -536,7 +536,7 @@ impl DockerStatPollingWorker {
                 metrics.blk_out.set(stat.blk_out);
                 metrics.blk_in_byteps.set(stat.blk_in_byteps);
                 metrics.blk_out_byteps.set(stat.blk_out_byteps);
-                
+
                 metrics.register_as_sub_registry(&mut registry, &stat.name[1..]);
             }
         };

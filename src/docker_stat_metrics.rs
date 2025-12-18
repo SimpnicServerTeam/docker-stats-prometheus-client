@@ -109,15 +109,14 @@ impl DockerStatContainerMetrics {
             self.net_out_bps.clone(),
         );
         sub_registry.register(
-            "blkio_receive_bps",
+            "blkio_receive_byteps",
             "Value of container blkio receive throughput in byte per second",
             self.blk_in_byteps.clone(),
         );
         sub_registry.register(
-            "blkio_transmit_bps",
+            "blkio_transmit_byteps",
             "Value of container blkio sent throughput in byte per second",
             self.blk_out_byteps.clone(),
         );
-
     }
 }
