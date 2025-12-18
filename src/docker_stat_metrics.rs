@@ -75,25 +75,25 @@ impl DockerStatContainerMetrics {
             self.mem_limit.clone(),
         );
         sub_registry.register_with_unit(
-            "network_receive_bytes",
+            "network_receive",
             "Value of container received data from network data in bytes",
             Unit::Bytes,
             self.net_in.clone(),
         );
         sub_registry.register_with_unit(
-            "network_transmit_bytes",
+            "network_transmit",
             "Value of container sent data from network in bytes",
             Unit::Bytes,
             self.net_out.clone(),
         );
         sub_registry.register_with_unit(
-            "blkio_receive_bytes",
+            "blkio_receive",
             "Value of container read data from blkio in bytes",
             Unit::Bytes,
             self.blk_in.clone(),
         );
         sub_registry.register_with_unit(
-            "blkio_transmit_bytes",
+            "blkio_transmit",
             "Value of container write data to blkio in bytes",
             Unit::Bytes,
             self.blk_out.clone(),
