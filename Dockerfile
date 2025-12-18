@@ -13,7 +13,7 @@ ENV CC="aarch64-linux-gnu-gcc"
 RUN cargo build --release --target aarch64-unknown-linux-gnu || true
 
 # build actual sources
-COPY ./src/ ./src/
+COPY ./src ./src
 ENV CC="aarch64-linux-gnu-gcc"
 RUN cargo build --release --target aarch64-unknown-linux-gnu
 
