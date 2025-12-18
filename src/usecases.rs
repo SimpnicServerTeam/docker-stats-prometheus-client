@@ -1,13 +1,18 @@
 use std::{
-    collections::HashMap, io, sync::Arc, time::{Duration, SystemTime}
+    collections::HashMap,
+    io,
+    sync::Arc,
+    time::{Duration, SystemTime},
 };
 
 use actix_web::http::Uri;
 use bollard::{
-    API_DEFAULT_VERSION, Docker, query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder}, secret::{
+    API_DEFAULT_VERSION, Docker,
+    query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder},
+    secret::{
         ContainerBlkioStats, ContainerCpuStats, ContainerMemoryStats, ContainerNetworkStats,
         ContainerStatsResponse,
-    }
+    },
 };
 use futures_util::TryStreamExt;
 use prometheus_client::registry::Registry;
@@ -158,13 +163,13 @@ async fn docker_stat_oneshot(host: &str) -> Result<Vec<TimedContainerStatsRespon
         }
     } else {
         match host.parse::<Uri>() {
-            Ok(u) =>  {
+            Ok(u) => {
                 let docker_result = match u.scheme_str() {
                     Some("http") => Docker::connect_with_http(host, 4, API_DEFAULT_VERSION),
                     // Some("https") => {
                     //     let _ = rustls::crypto::CryptoProvider::install_default(aws_lc_rs::default_provider());
                     //     let uri_parts = u.into_parts();
-                    //     let addr = format!("tcp://{}{}", 
+                    //     let addr = format!("tcp://{}{}",
                     //         uri_parts.authority.map(|a| a.to_string()).unwrap_or("".to_owned()),
                     //         uri_parts.path_and_query.map(|pq| pq.to_string()).unwrap_or("".to_owned()));
                     //     Docker::connect_with_ssl(&addr, Path::new("./key.pem"), Path::new("./cert.pem"), Path::new("./ca.pem"), 4, API_DEFAULT_VERSION)
@@ -173,14 +178,14 @@ async fn docker_stat_oneshot(host: &str) -> Result<Vec<TimedContainerStatsRespon
                     _ => {
                         warn!("not supported docker uri scheme, fallback to defaults");
                         Docker::connect_with_defaults()
-                    },
+                    }
                 };
 
                 match docker_result {
                     Ok(d) => d,
                     Err(e) => return Err(io::Error::new(io::ErrorKind::BrokenPipe, e)),
                 }
-            },
+            }
             Err(_) => {
                 warn!("invalid docker uri, fallback to defaults");
                 match Docker::connect_with_defaults() {
@@ -412,8 +417,8 @@ impl DockerStatPollingWorker {
                             (stat.net_in - first_net_in) as f64 * time_delta,
                             (stat.net_out - first_net_out) as f64 * time_delta,
                         );
-                        stat.net_in_bps = net_in_bps;
-                        stat.net_out_bps = net_out_bps;
+                        stat.net_in_bps = net_in_bps * 8.;
+                        stat.net_out_bps = net_out_bps * 8.;
 
                         // get blkio bps between the stats
                         let (first_blk_in, first_blk_out) =
@@ -469,11 +474,11 @@ impl DockerStatPollingWorker {
         }
     }
 
-    pub fn new(host: &str) -> Self {
+    pub fn new(host: &str, polling_millis: u64) -> Self {
         Self {
             docker_host: host.to_owned(),
             prom_registry_prefix: Arc::new(Mutex::new("container".to_owned())),
-            delay_ms: Arc::new(Mutex::new(2000)),
+            delay_ms: Arc::new(Mutex::new(polling_millis)),
             last_stats: Arc::new(Mutex::new(LastDockerStats {
                 timestamp: SystemTime::now(),
                 stats: Vec::new(),
@@ -525,8 +530,13 @@ impl DockerStatPollingWorker {
                 metrics.mem_limit.set(stat.mem_limit);
                 metrics.net_in.set(stat.net_in);
                 metrics.net_out.set(stat.net_out);
+                metrics.net_in_bps.set(stat.net_in_bps);
+                metrics.net_out_bps.set(stat.net_out_bps);
                 metrics.blk_in.set(stat.blk_in);
                 metrics.blk_out.set(stat.blk_out);
+                metrics.blk_in_byteps.set(stat.blk_in_byteps);
+                metrics.blk_out_byteps.set(stat.blk_out_byteps);
+                
                 metrics.register_as_sub_registry(&mut registry, &stat.name[1..]);
             }
         };

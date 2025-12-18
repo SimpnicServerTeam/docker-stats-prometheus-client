@@ -19,7 +19,6 @@ use crate::{http_handlers::SharedAppData, usecases::DockerStatPollingWorker};
 #[derive(Debug, clap::Parser)]
 struct CliArgs {
     /// docker host
-    ///
     #[arg(
         short = 'H',
         long,
@@ -28,21 +27,25 @@ struct CliArgs {
     )]
     host: String,
 
-    /// HTTP bind host
+    /// HTTP/HTTPS server bind host
     #[arg(short = 'b', long, default_value = "0.0.0.0:12096")]
     bind: String,
 
-    /// HTTPS mode
+    /// enable HTTPS mode
     #[arg(short = 's', long = "secure", default_value_t = false)]
     bind_secure: bool,
 
-    /// TLS key path
+    /// HTTPS server key path
     #[arg(long = "tls_key", default_value = "./server.key")]
     tls_key_path: Option<String>,
 
-    /// TLS certificate path
+    /// HTTPS server certificate path
     #[arg(long = "tls_cert", default_value = "./server.crt")]
     tls_cert_path: Option<String>,
+
+    /// polling interval in milliseconds
+    #[arg(short = 'i', long = "polling_interval", default_value_t = 2000)]
+    polling_millis: u64,
 }
 
 #[test]
@@ -71,7 +74,7 @@ async fn main() {
 
     let args = CliArgs::parse();
 
-    let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(&args.host));
+    let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(&args.host, args.polling_millis));
     polling_stat_worker.spawn_polling_stat_task(polling_stat_worker.clone());
 
     let docker_host_4_servr = args.host.clone();
