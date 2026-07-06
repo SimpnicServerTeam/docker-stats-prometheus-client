@@ -8,11 +8,11 @@ use std::{
 use actix_web::http::Uri;
 use bollard::{
     API_DEFAULT_VERSION, Docker,
-    query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder},
-    secret::{
+    plugin::{
         ContainerBlkioStats, ContainerCpuStats, ContainerMemoryStats, ContainerNetworkStats,
         ContainerStatsResponse,
     },
+    query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder},
 };
 use futures_util::TryStreamExt;
 use prometheus_client::registry::Registry;

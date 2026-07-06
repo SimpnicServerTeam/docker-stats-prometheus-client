@@ -2,13 +2,14 @@ pub mod docker_stat_metrics;
 pub mod http_handlers;
 pub mod usecases;
 
-use std::{fs::File, io::BufReader, sync::Arc};
+use std::{path::Path, sync::Arc};
 // use rayon::prelude::*;
 use actix_web::{
     App, HttpServer, middleware,
     web::{self},
 };
 use clap::Parser;
+use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tracing::level_filters::LevelFilter;
 use tracing_actix_web::TracingLogger;
 use tracing_subscriber::{Layer, layer::SubscriberExt};
@@ -82,23 +83,15 @@ async fn main() {
             .install_default()
             .unwrap();
 
-        let mut certs_file = BufReader::new(File::open(args.tls_cert_path.unwrap()).unwrap());
-        let mut key_file = BufReader::new(File::open(args.tls_key_path.unwrap()).unwrap());
-
         // load TLS certs and key
         // to create a self-signed temporary cert for testing:
-        let tls_certs = rustls_pemfile::certs(&mut certs_file)
-            .collect::<Result<Vec<_>, _>>()
-            .unwrap();
-        let tls_key = rustls_pemfile::pkcs8_private_keys(&mut key_file)
-            .next()
-            .unwrap()
-            .unwrap();
+        let cert = CertificateDer::from_pem_file(Path::new(&args.tls_cert_path.unwrap())).unwrap();
+        let key = PrivateKeyDer::from_pem_file(Path::new(&args.tls_key_path.unwrap())).unwrap();
 
         // set up TLS config options
         let tls_config = rustls::ServerConfig::builder()
             .with_no_client_auth()
-            .with_single_cert(tls_certs, rustls::pki_types::PrivateKeyDer::Pkcs8(tls_key))
+            .with_single_cert(vec![cert], key)
             .unwrap();
 
         http_server
