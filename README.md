@@ -19,6 +19,9 @@ Options:
           [default: docker]
           [possible values: docker, containerd, podman]
 
+      --runtime_proc <RUNTIME_PROC>
+          [default: /tmp/proc]
+
   -H, --host <HOST>
           default value will connect to OS specific handler
           
@@ -96,6 +99,7 @@ https://github.com/containerd/cgroups/blob/main/cgroup2/stats/metrics.proto
       --name container-stats-exporter \
       -p 12096:12096 \
       -v /var/run/containerd/containerd.sock:/var/run/containerd/containerd.sock \
+      -v /proc:/tmp/proc:ro \
       --restart unless-stopped \
       cts/container-stats-exporter:latest \
       --runtime containerd \

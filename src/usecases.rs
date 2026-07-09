@@ -14,7 +14,7 @@ use bollard::{
     query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder},
 };
 use containerd_client::{
-    services::v1::{ListContainersRequest, MetricsRequest},
+    services::v1::{ListContainersRequest, ListTasksRequest, MetricsRequest},
     tonic::transport::Channel as ContainerdChannel,
 };
 use containerd_client::{tonic::Request, with_namespace};
@@ -123,6 +123,7 @@ pub struct LastDockerStats {
 #[derive(Debug)]
 pub struct DockerStatPollingWorker {
     runtime: String,
+    runtime_proc: String,
     namespace: String,
     host: String,
     prom_registry_prefix: String,
@@ -369,30 +370,49 @@ impl DockerStatPollingWorker {
         };
 
         let mut id_name_map = HashMap::new();
+        let mut id_pid_map = HashMap::new();
 
         let mut client = containerd_client::services::v1::containers_client::ContainersClient::new(
             channel.clone(),
         );
         let request = ListContainersRequest::default();
         let request = with_namespace!(request, &self.namespace);
-        let containers_response = match client.list(request).await {
-            Ok(r) => r.get_ref().clone(),
+        match client.list(request).await {
+            Ok(r) => {
+                let response = r.get_ref().clone();
+                for container in response.containers {
+                    if let Some(name) = container.labels.get("nerdctl/name") {
+                        id_name_map.insert(container.id.clone(), name.clone());
+                    }
+                }
+            }
             Err(e) => {
                 error!("containerd_client::list failed, error: {}", e);
                 return Err(io::Error::new(io::ErrorKind::BrokenPipe, e));
             }
         };
-        for container in containers_response.containers {
-            if let Some(name) = container.labels.get("nerdctl/name") {
-                id_name_map.insert(container.id.clone(), name.clone());
-            }
-        }
 
         let mut client =
             containerd_client::services::v1::tasks_client::TasksClient::new(channel.clone());
 
+        let request = ListTasksRequest::default();
+        let request = with_namespace!(request, &self.namespace);
+        match client.list(request).await {
+            Ok(r) => {
+                let response = r.get_ref();
+                for task in response.tasks.clone() {
+                    trace!("task: {:?}", task);
+                    id_pid_map.insert(task.id.clone(), task.pid);
+                }
+            }
+            Err(e) => {
+                error!("containerd_client::list failed, error: {}", e);
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, e));
+            }
+        }
+
         let request = MetricsRequest::default();
-        let request = with_namespace!(request, "default");
+        let request = with_namespace!(request, self.namespace);
 
         let response = match client.metrics(request).await {
             Ok(r) => r.get_ref().clone(),
@@ -403,7 +423,7 @@ impl DockerStatPollingWorker {
         };
         let mut containerd_metrics = Vec::new();
         for metric in response.metrics {
-            // trace!("metric: {:?}", metric);
+            trace!("metric: {:?}", metric);
             let Some(data) = metric.data.as_ref() else {
                 warn!("metric '{}' has no data", metric.id);
                 continue;
@@ -423,6 +443,7 @@ impl DockerStatPollingWorker {
                     continue;
                 }
             };
+            trace!("metric_data: {:?}", metric_data);
 
             let name = id_name_map.get(&metric.id).unwrap_or(&metric.id);
             let mut stats = ContainerStats {
@@ -430,7 +451,12 @@ impl DockerStatPollingWorker {
                 name: name.clone(),
                 ..Default::default()
             };
-            trace!("container {}, id: {}", name, metric.id);
+            trace!(
+                "container {}, pid: {:?}, id: {}",
+                name,
+                id_pid_map.get(&metric.id),
+                metric.id
+            );
 
             if let Some(cpu_stat) = metric_data.cpu {
                 trace!(
@@ -480,7 +506,7 @@ impl DockerStatPollingWorker {
                     io_sum.wios += entry.wios;
                 }
                 trace!(
-                    "io rbytes: {}, wbytes: {}, rios: {}, wios: {}",
+                    "  io rbytes: {}, wbytes: {}, rios: {}, wios: {}",
                     io_sum.rbytes, io_sum.wbytes, io_sum.rios, io_sum.wios
                 );
 
@@ -489,25 +515,72 @@ impl DockerStatPollingWorker {
                 stats.blk_in_ios = io_sum.rios;
                 stats.blk_out_ios = io_sum.wios;
             }
-            let mut network_stat = NetworkStat::default();
-            for net in metric_data.network {
-                trace!(
-                    "  network '{}': rx_bytes={} tx_bytes={}, rx_packets={} tx_packets={}",
-                    net.name, net.rx_bytes, net.tx_bytes, net.rx_packets, net.tx_packets
-                );
-                network_stat.rx_bytes += net.rx_bytes;
-                network_stat.tx_bytes += net.tx_bytes;
-                network_stat.rx_packets += net.rx_packets;
-                network_stat.tx_packets += net.tx_packets;
-                network_stat.rx_errors += net.rx_errors;
-                network_stat.tx_errors += net.tx_errors;
-                network_stat.rx_dropped += net.rx_dropped;
-                network_stat.tx_dropped += net.tx_dropped;
+
+            if let Some(pid) = id_pid_map.get(&metric.id) {
+                let netdev_path = format!("{}/{}/net/dev", self.runtime_proc, pid);
+                match std::fs::read_to_string(&netdev_path) {
+                    Ok(content) => {
+                        let mut network_stat = NetworkStat::default();
+
+                        for line in content.lines().skip(2) {
+                            let Some((iface, rest)) = line.split_once(':') else {
+                                continue;
+                            };
+
+                            if iface == "lo" {
+                                continue;
+                            }
+
+                            let iface = iface.trim();
+                            let fields: Vec<&str> = rest.split_whitespace().collect();
+                            let rx_bytes: u64 = fields[0].parse().unwrap_or(0);
+                            let rx_packets: u64 = fields[1].parse().unwrap_or(0);
+                            let rx_errs: u64 = fields[2].parse().unwrap_or(0);
+                            let rx_dropped: u64 = fields[3].parse().unwrap_or(0);
+                            let tx_bytes: u64 = fields[8].parse().unwrap_or(0);
+                            let tx_packets: u64 = fields[9].parse().unwrap_or(0);
+                            let tx_errs: u64 = fields[10].parse().unwrap_or(0);
+                            let tx_dropped: u64 = fields[11].parse().unwrap_or(0);
+                            trace!(
+                                "  iface: {}, rx_bytes={} tx_bytes={} rx_packets={} tx_packets={} rx_errs={} tx_errs={} rx_dropped={} tx_dropped={}",
+                                iface,
+                                rx_bytes,
+                                tx_bytes,
+                                rx_packets,
+                                tx_packets,
+                                rx_errs,
+                                tx_errs,
+                                rx_dropped,
+                                tx_dropped
+                            );
+
+                            network_stat.rx_bytes = network_stat.rx_bytes.saturating_add(rx_bytes);
+                            network_stat.rx_packets =
+                                network_stat.rx_packets.saturating_add(rx_packets);
+                            network_stat.rx_errors = network_stat.rx_errors.saturating_add(rx_errs);
+                            network_stat.rx_dropped =
+                                network_stat.rx_dropped.saturating_add(rx_dropped);
+                            network_stat.tx_bytes = network_stat.tx_bytes.saturating_add(tx_bytes);
+                            network_stat.tx_packets =
+                                network_stat.tx_packets.saturating_add(tx_packets);
+                            network_stat.tx_errors = network_stat.tx_errors.saturating_add(tx_errs);
+                            network_stat.tx_dropped =
+                                network_stat.tx_dropped.saturating_add(tx_dropped);
+                        }
+
+                        stats.net_in = network_stat.rx_bytes;
+                        stats.net_out = network_stat.tx_bytes;
+                        stats.net_in_packets = network_stat.rx_packets;
+                        stats.net_out_packets = network_stat.tx_packets;
+                    }
+                    Err(e) => {
+                        warn!(
+                            "retreive network metrics data failed, path: {}, error: {:?}",
+                            netdev_path, e
+                        );
+                    }
+                }
             }
-            stats.net_in = network_stat.rx_bytes;
-            stats.net_out = network_stat.tx_bytes;
-            stats.net_in_packets = network_stat.rx_packets;
-            stats.net_out_packets = network_stat.tx_packets;
 
             if let Some(pid_stat) = metric_data.pids {
                 stats.pids = pid_stat.current;
@@ -760,9 +833,16 @@ impl DockerStatPollingWorker {
         }
     }
 
-    pub fn new(runtime: &str, namespace: &str, host: &str, polling_millis: u64) -> Self {
+    pub fn new(
+        runtime: &str,
+        runtime_proc: &str,
+        namespace: &str,
+        host: &str,
+        polling_millis: u64,
+    ) -> Self {
         Self {
             runtime: runtime.to_owned(),
+            runtime_proc: runtime_proc.to_owned(),
             namespace: namespace.to_owned(),
             host: host.to_owned(),
             prom_registry_prefix: "container".to_string(),

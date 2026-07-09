@@ -38,6 +38,9 @@ struct CliArgs {
     #[arg(short = 'r', long = "runtime", default_value = "docker")]
     runtime: Runtime,
 
+    #[arg(long = "runtime_proc", default_value = "/tmp/proc")]
+    runtime_proc: String,
+
     /// docker host
     #[arg(
         short = 'H',
@@ -100,6 +103,7 @@ async fn main() {
 
     let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(
         args.runtime.to_string().as_str(),
+        &args.runtime_proc,
         &args.namespace,
         &args.host,
         args.polling_millis,
