@@ -27,3 +27,10 @@ serde = { version = "1.0.228", features = ["derive"] }
 tracing-actix-web = { version = "0.7.20", features = ["opentelemetry_0_31"] }
 rayon = "1.11.0"
 tracing-opentelemetry = "0.32.0"
+containerd-client = "0.9.0"
+prost = "0.14"
+prost-types = "0.14"
+tonic = "0.14"
+
+[build-dependencies]
+prost-build = "0.14"

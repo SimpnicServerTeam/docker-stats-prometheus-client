@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     io,
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{Duration, SystemTime},
 };
 
@@ -9,51 +9,93 @@ use actix_web::http::Uri;
 use bollard::{
     API_DEFAULT_VERSION, Docker,
     plugin::{
-        ContainerBlkioStats, ContainerCpuStats, ContainerMemoryStats, ContainerNetworkStats,
-        ContainerStatsResponse,
+        ContainerBlkioStats, ContainerCpuStats, ContainerNetworkStats, ContainerStatsResponse,
     },
     query_parameters::{ListContainersOptionsBuilder, StatsOptionsBuilder},
 };
+use containerd_client::{
+    services::v1::{ListContainersRequest, MetricsRequest},
+    tonic::transport::Channel as ContainerdChannel,
+};
+use containerd_client::{tonic::Request, with_namespace};
 use futures_util::TryStreamExt;
 use prometheus_client::registry::Registry;
+use prost::Message;
 use serde::Serialize;
-use tokio::{sync::Mutex, task::JoinHandle};
+use tokio::sync::Mutex;
 use tracing::*;
 
-use crate::docker_stat_metrics::DockerStatContainerMetrics;
+use crate::{
+    docker_stat_metrics::DockerStatContainerMetrics,
+    usecases::cgroups_v2::{IoEntry, NetworkStat},
+};
+
+pub mod cgroups_v2 {
+    include!(concat!(env!("OUT_DIR"), "/io.containerd.cgroups.v2.rs"));
+}
 
 #[derive(Debug, Clone, Serialize)]
-pub struct DockerContainerStat {
+pub struct ContainerStats {
     pub id: String,
     pub name: String,
     pub cpu_usage: f64,
+    pub cpu_usage_usec: u64,
+    pub cpu_user_usec: u64,
+    pub cpu_sys_usec: u64,
+    pub cpu_nr_periods: u64,
+    pub cpu_nr_throttled: u64,
+    pub cpu_throttled_usec: u64,
     pub mem_usage: u64,
     pub mem_limit: u64,
+    pub mem_swap_usage: u64,
+    pub mem_swap_limit: u64,
+    pub mem_pgfault: u64,
+    pub mem_pgmajfault: u64,
     pub net_in: u64,
     pub net_out: u64,
     pub net_in_bps: f64,
     pub net_out_bps: f64,
+    pub net_in_packets: u64,
+    pub net_out_packets: u64,
     pub blk_in: u64,
     pub blk_out: u64,
     pub blk_in_byteps: f64,
     pub blk_out_byteps: f64,
+    pub blk_in_ios: u64,
+    pub blk_out_ios: u64,
+    pub pids: u64,
 }
-impl Default for DockerContainerStat {
+impl Default for ContainerStats {
     fn default() -> Self {
         Self {
             id: Default::default(),
             name: Default::default(),
             cpu_usage: Default::default(),
+            cpu_usage_usec: Default::default(),
+            cpu_user_usec: Default::default(),
+            cpu_sys_usec: Default::default(),
+            cpu_nr_periods: Default::default(),
+            cpu_nr_throttled: Default::default(),
+            cpu_throttled_usec: Default::default(),
             mem_usage: Default::default(),
             mem_limit: Default::default(),
+            mem_swap_usage: Default::default(),
+            mem_swap_limit: Default::default(),
+            mem_pgfault: Default::default(),
+            mem_pgmajfault: Default::default(),
             net_in: Default::default(),
             net_out: Default::default(),
             net_in_bps: Default::default(),
             net_out_bps: Default::default(),
+            net_in_packets: Default::default(),
+            net_out_packets: Default::default(),
             blk_in: Default::default(),
             blk_out: Default::default(),
+            blk_in_ios: Default::default(),
+            blk_out_ios: Default::default(),
             blk_in_byteps: Default::default(),
             blk_out_byteps: Default::default(),
+            pids: Default::default(),
         }
     }
 }
@@ -64,6 +106,35 @@ pub struct TimedContainerStatsResponse {
     name: String,
     stat: Option<ContainerStatsResponse>,
     time: SystemTime,
+}
+
+#[derive(Debug, Clone)]
+struct LastDockerAPIContainersStats {
+    pub timestamp: SystemTime,
+    pub stats: HashMap<String, TimedContainerStatsResponse>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct LastDockerStats {
+    pub timestamp: SystemTime,
+    pub stats: Vec<ContainerStats>,
+}
+
+#[derive(Debug)]
+pub struct DockerStatPollingWorker {
+    runtime: String,
+    namespace: String,
+    host: String,
+    prom_registry_prefix: String,
+    delay_ms: Arc<Mutex<u64>>,
+
+    containerd_channel: OnceLock<ContainerdChannel>,
+
+    /// last collected docker stats record
+    last_stats: Arc<Mutex<LastDockerStats>>,
+
+    /// last records of `GET /container/{id}/stats` api
+    last_docker_stats: Arc<Mutex<LastDockerAPIContainersStats>>,
 }
 
 /// raspberry pi did not have precpu_stats data, we need to get CPU usage by hand
@@ -108,56 +179,42 @@ fn get_cpu_usage(first: &ContainerCpuStats, second: &ContainerCpuStats, time_del
     }
 }
 
-fn get_mem(mem: &ContainerMemoryStats) -> Result<u64, io::Error> {
-    let usage = if let Some(u) = mem.usage {
-        u
-    } else {
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no usage"));
-    };
-
-    if let Some(stats) = &mem.stats {
-        if let Some(file) = stats.get("file") {
-            return Ok(usage - file);
-        }
-
-        return Err(io::Error::new(io::ErrorKind::InvalidInput, "no file"));
-    }
-
-    return Err(io::Error::new(io::ErrorKind::InvalidInput, "no stat"));
-}
-
-fn get_net_io(networks: &HashMap<String, ContainerNetworkStats>) -> (u64, u64) {
+fn get_net_io(networks: &HashMap<String, ContainerNetworkStats>) -> (u64, u64, u64, u64) {
     let mut net_in = 0;
     let mut net_out = 0;
+    let mut pkt_in = 0;
+    let mut pkt_out = 0;
 
     for (_, net) in networks {
         net_in += net.rx_bytes.unwrap_or(0);
         net_out += net.tx_bytes.unwrap_or(0);
+        pkt_in += net.rx_packets.unwrap_or(0);
+        pkt_out += net.tx_packets.unwrap_or(0);
     }
 
-    return (net_in, net_out);
+    return (net_in, net_out, pkt_in, pkt_out);
 }
 
-fn get_blk_io(networks: &ContainerBlkioStats) -> (u64, u64) {
-    let mut net_in = 0;
-    let mut net_out = 0;
+fn get_blk_io(blk_stat: &ContainerBlkioStats) -> (u64, u64) {
+    let mut blk_in = 0;
+    let mut blk_out = 0;
 
-    if let Some(v) = &networks.io_service_bytes_recursive {
+    if let Some(v) = &blk_stat.io_service_bytes_recursive {
         for blk in v {
             let op = blk.op.as_deref();
             if op == Some("read") {
                 if let Some(value) = blk.value {
-                    net_in += value
+                    blk_in += value
                 }
             } else if op == Some("write") {
                 if let Some(value) = blk.value {
-                    net_out += value
+                    blk_out += value
                 }
             }
         }
     }
 
-    return (net_in, net_out);
+    return (blk_in, blk_out);
 }
 
 async fn docker_stat_oneshot(host: &str) -> Result<Vec<TimedContainerStatsResponse>, io::Error> {
@@ -279,39 +336,243 @@ async fn docker_stat_oneshot(host: &str) -> Result<Vec<TimedContainerStatsRespon
     Ok(stats)
 }
 
-#[derive(Debug, Clone)]
-struct LastDockerAPIContainersStats {
-    pub timestamp: SystemTime,
-    pub stats: HashMap<String, TimedContainerStatsResponse>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-pub struct LastDockerStats {
-    pub timestamp: SystemTime,
-    pub stats: Vec<DockerContainerStat>,
-}
-
-#[derive(Debug)]
-pub struct DockerStatPollingWorker {
-    docker_host: String,
-    prom_registry_prefix: Arc<Mutex<String>>,
-    delay_ms: Arc<Mutex<u64>>,
-
-    /// last collected docker stats record
-    last_stats: Arc<Mutex<LastDockerStats>>,
-
-    /// last records of `GET /container/{id}/stats` api
-    last_docker_stats: Arc<Mutex<LastDockerAPIContainersStats>>,
+async fn podman_stat_oneshot(host: &str) -> Result<Vec<TimedContainerStatsResponse>, io::Error> {
+    todo!()
 }
 
 impl DockerStatPollingWorker {
-    async fn task_handler(&self) {
+    async fn containerd_stat_oneshot(&self, host: &str) -> Result<Vec<ContainerStats>, io::Error> {
+        let channel = match self.containerd_channel.get() {
+            Some(c) => c,
+            None => {
+                let host = match host.strip_prefix("unix://") {
+                    Some(h) => h,
+                    None => {
+                        error!("containerd_stat_oneshot: only supports unix socket");
+                        return Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "only supports unix socket in containerd runtime",
+                        ));
+                    }
+                };
+                let channel = match containerd_client::connect(host).await {
+                    Ok(channel) => channel,
+                    Err(e) => {
+                        error!("containerd_client::connect failed, error: {}", e);
+                        return Err(io::Error::new(io::ErrorKind::BrokenPipe, e));
+                    }
+                };
+
+                self.containerd_channel.set(channel.clone()).unwrap();
+                &channel.clone()
+            }
+        };
+
+        let mut id_name_map = HashMap::new();
+
+        let mut client = containerd_client::services::v1::containers_client::ContainersClient::new(
+            channel.clone(),
+        );
+        let request = ListContainersRequest::default();
+        let request = with_namespace!(request, &self.namespace);
+        let containers_response = match client.list(request).await {
+            Ok(r) => r.get_ref().clone(),
+            Err(e) => {
+                error!("containerd_client::list failed, error: {}", e);
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, e));
+            }
+        };
+        for container in containers_response.containers {
+            if let Some(name) = container.labels.get("nerdctl/name") {
+                id_name_map.insert(container.id.clone(), name.clone());
+            }
+        }
+
+        let mut client =
+            containerd_client::services::v1::tasks_client::TasksClient::new(channel.clone());
+
+        let request = MetricsRequest::default();
+        let request = with_namespace!(request, "default");
+
+        let response = match client.metrics(request).await {
+            Ok(r) => r.get_ref().clone(),
+            Err(e) => {
+                error!("containerd_client::metrics failed, error: {}", e);
+                return Err(io::Error::new(io::ErrorKind::BrokenPipe, e));
+            }
+        };
+        let mut containerd_metrics = Vec::new();
+        for metric in response.metrics {
+            // trace!("metric: {:?}", metric);
+            let Some(data) = metric.data.as_ref() else {
+                warn!("metric '{}' has no data", metric.id);
+                continue;
+            };
+            let metric_data = match data.type_url.as_str() {
+                "io.containerd.cgroups.v2.Metrics" => {
+                    match cgroups_v2::Metrics::decode(data.value.as_slice()) {
+                        Ok(decoded) => decoded,
+                        Err(e) => {
+                            warn!("failed to decode containerd metrics: {}", e);
+                            continue;
+                        }
+                    }
+                }
+                other => {
+                    warn!("unsupported containerd metric type: {}", other);
+                    continue;
+                }
+            };
+
+            let name = id_name_map.get(&metric.id).unwrap_or(&metric.id);
+            let mut stats = ContainerStats {
+                id: metric.id.clone(),
+                name: name.clone(),
+                ..Default::default()
+            };
+            trace!("container {}, id: {}", name, metric.id);
+
+            if let Some(cpu_stat) = metric_data.cpu {
+                trace!(
+                    "  cpu usage_usec={} user_usec={} system_usec={}",
+                    cpu_stat.usage_usec, cpu_stat.user_usec, cpu_stat.system_usec
+                );
+                stats.cpu_usage_usec = cpu_stat.usage_usec;
+                stats.cpu_user_usec = cpu_stat.user_usec;
+                stats.cpu_sys_usec = cpu_stat.system_usec;
+                stats.cpu_nr_periods = cpu_stat.nr_periods;
+                stats.cpu_nr_throttled = cpu_stat.nr_throttled;
+                stats.cpu_throttled_usec = cpu_stat.throttled_usec;
+            }
+            if let Some(mem_stat) = metric_data.memory {
+                trace!(
+                    "  mem usage={} limit={} swap_usage={} swap_limit={} pgfault={} pgmajfault={}",
+                    mem_stat.usage,
+                    mem_stat.usage_limit,
+                    mem_stat.swap_usage,
+                    mem_stat.swap_limit,
+                    mem_stat.pgfault,
+                    mem_stat.pgmajfault
+                );
+                stats.mem_usage = mem_stat.usage.saturating_sub(mem_stat.file);
+                stats.mem_limit = if mem_stat.usage_limit == u64::MAX {
+                    0
+                } else {
+                    mem_stat.usage_limit
+                };
+                stats.mem_swap_usage = mem_stat.swap_usage;
+                stats.mem_swap_limit = if mem_stat.swap_limit == u64::MAX {
+                    0
+                } else {
+                    mem_stat.swap_limit
+                };
+                stats.mem_pgfault = mem_stat.pgfault;
+                stats.mem_pgmajfault = mem_stat.pgmajfault;
+            }
+            if let Some(io_stat) = metric_data.io {
+                let mut io_sum = IoEntry::default();
+                for entry in io_stat.usage {
+                    io_sum.major += entry.major;
+                    io_sum.minor += entry.minor;
+                    io_sum.rbytes += entry.rbytes;
+                    io_sum.wbytes += entry.wbytes;
+                    io_sum.rios += entry.rios;
+                    io_sum.wios += entry.wios;
+                }
+                trace!(
+                    "io rbytes: {}, wbytes: {}, rios: {}, wios: {}",
+                    io_sum.rbytes, io_sum.wbytes, io_sum.rios, io_sum.wios
+                );
+
+                stats.blk_in = io_sum.rbytes;
+                stats.blk_out = io_sum.wbytes;
+                stats.blk_in_ios = io_sum.rios;
+                stats.blk_out_ios = io_sum.wios;
+            }
+            let mut network_stat = NetworkStat::default();
+            for net in metric_data.network {
+                trace!(
+                    "  network '{}': rx_bytes={} tx_bytes={}, rx_packets={} tx_packets={}",
+                    net.name, net.rx_bytes, net.tx_bytes, net.rx_packets, net.tx_packets
+                );
+                network_stat.rx_bytes += net.rx_bytes;
+                network_stat.tx_bytes += net.tx_bytes;
+                network_stat.rx_packets += net.rx_packets;
+                network_stat.tx_packets += net.tx_packets;
+                network_stat.rx_errors += net.rx_errors;
+                network_stat.tx_errors += net.tx_errors;
+                network_stat.rx_dropped += net.rx_dropped;
+                network_stat.tx_dropped += net.tx_dropped;
+            }
+            stats.net_in = network_stat.rx_bytes;
+            stats.net_out = network_stat.tx_bytes;
+            stats.net_in_packets = network_stat.rx_packets;
+            stats.net_out_packets = network_stat.tx_packets;
+
+            if let Some(pid_stat) = metric_data.pids {
+                stats.pids = pid_stat.current;
+            }
+
+            containerd_metrics.push(stats);
+        }
+
+        Ok(containerd_metrics)
+    }
+
+    pub async fn task_handler(&self) {
+        trace!("runtime: {}, host: {}", self.runtime, self.host);
+
         loop {
             // get last docker stats from api
-            let last_api_stats = match docker_stat_oneshot(&self.docker_host).await {
+            let last_api_stats = match self.runtime.as_str() {
+                "docker" => docker_stat_oneshot(&self.host).await,
+                "containerd" => {
+                    let mut metrics = match self.containerd_stat_oneshot(&self.host).await {
+                        Ok(v) => v,
+                        Err(e) => {
+                            error!("containerd_stat_oneshot failed, error: {}", e);
+
+                            let delay = {
+                                let delay_guard = self.delay_ms.lock().await;
+                                Duration::from_millis(*delay_guard)
+                            };
+                            tokio::time::sleep(delay).await;
+
+                            continue;
+                        }
+                    };
+
+                    let _ = {
+                        let mut last_stat_guard = self.last_stats.lock().await;
+                        last_stat_guard.timestamp = SystemTime::now();
+                        last_stat_guard.stats.clear();
+                        last_stat_guard.stats.append(&mut metrics);
+                    };
+
+                    let delay = {
+                        let delay_guard = self.delay_ms.lock().await;
+                        Duration::from_millis(*delay_guard)
+                    };
+                    tokio::time::sleep(delay).await;
+
+                    continue;
+                }
+                "podman" => podman_stat_oneshot(&self.host).await,
+                _ => {
+                    error!("runtime {} not supported", self.runtime);
+                    break;
+                }
+            };
+            let last_api_stats = match last_api_stats {
                 Ok(v) => v,
                 Err(e) => {
                     error!("docker_stat_oneshot failed, error: {}", e);
+
+                    let delay = {
+                        let delay_guard = self.delay_ms.lock().await;
+                        Duration::from_millis(*delay_guard)
+                    };
+                    tokio::time::sleep(delay).await;
                     continue;
                 }
             };
@@ -321,70 +582,68 @@ impl DockerStatPollingWorker {
 
             let start_at = SystemTime::now();
             for container_api_stat in last_api_stats.iter() {
-                let mut stat = if let Some(ref s) = container_api_stat.stat {
-                    let cpu_usage = if let Some(cpu_stats) = &s.cpu_stats {
+                let mut stat = ContainerStats {
+                    id: container_api_stat.id.clone(),
+                    name: container_api_stat.name.clone(),
+                    ..Default::default()
+                };
+
+                if let Some(ref s) = container_api_stat.stat {
+                    if let Some(cpu_stats) = &s.cpu_stats {
+                        if let Some(cpu_usage) = &cpu_stats.cpu_usage {
+                            // usage data is in nanoseconds
+                            if let Some(ns) = cpu_usage.total_usage {
+                                stat.cpu_usage_usec = ns / 1_000;
+                            }
+                            if let Some(ns) = cpu_usage.usage_in_kernelmode {
+                                stat.cpu_sys_usec = ns / 1_000;
+                            }
+                            if let Some(ns) = cpu_usage.usage_in_usermode {
+                                stat.cpu_user_usec = ns / 1_000;
+                            }
+                        }
+
                         let system_cpu_usage = cpu_stats.system_cpu_usage.unwrap_or(0) as f64;
                         let total_usage = if let Some(u) = &cpu_stats.cpu_usage {
                             u.total_usage.unwrap_or(0) as f64
                         } else {
                             0.
                         };
-                        total_usage / system_cpu_usage
-                    } else {
-                        0.
-                    };
 
-                    let (mem_usage, mem_limit) = if let Some(mem_stats) = &s.memory_stats {
-                        let limit = mem_stats.limit.unwrap_or(0);
-                        let usage = match get_mem(&mem_stats) {
-                            Ok(u) => u,
-                            Err(e) => {
-                                warn!("get_mem failed, error: {}", e);
-                                0
-                            }
-                        };
-                        if usage < limit {
-                            (usage, limit)
-                        } else {
-                            (limit, limit)
+                        stat.cpu_usage = total_usage / system_cpu_usage;
+                    }
+
+                    if let Some(mem_stats) = &s.memory_stats {
+                        if let Some(limit) = mem_stats.limit {
+                            stat.mem_limit = limit;
                         }
-                    } else {
-                        (0, 0)
-                    };
-
-                    // net io
-                    let (net_in, net_out) = if let Some(networks) = &s.networks {
-                        get_net_io(networks)
-                    } else {
-                        (0, 0)
-                    };
-
-                    // blk io
-                    let (blk_in, blk_out) = if let Some(blkio) = &s.blkio_stats {
-                        get_blk_io(blkio)
-                    } else {
-                        (0, 0)
-                    };
-
-                    DockerContainerStat {
-                        id: container_api_stat.id.clone(),
-                        name: container_api_stat.name.clone(),
-                        cpu_usage,
-                        mem_usage,
-                        mem_limit,
-                        net_in,
-                        net_out,
-                        blk_in,
-                        blk_out,
-                        ..Default::default()
+                        if let (Some(usage), Some(stats)) = (mem_stats.usage, &mem_stats.stats) {
+                            if let Some(file) = stats.get("file") {
+                                stat.mem_usage = usage.saturating_sub(*file);
+                            }
+                        }
                     }
-                } else {
-                    DockerContainerStat {
-                        id: container_api_stat.id.clone(),
-                        name: container_api_stat.name.clone(),
-                        ..Default::default()
+
+                    if let Some(networks) = &s.networks {
+                        let (net_in, net_out, pkt_in, pkt_out) = get_net_io(networks);
+                        stat.net_in = net_in;
+                        stat.net_out = net_out;
+                        stat.net_in_packets = pkt_in;
+                        stat.net_out_packets = pkt_out;
                     }
-                };
+
+                    if let Some(blkio_stats) = &s.blkio_stats {
+                        let (blk_in, blk_out) = get_blk_io(blkio_stats);
+                        stat.blk_in = blk_in;
+                        stat.blk_out = blk_out;
+                    }
+
+                    if let Some(pids) = &s.pids_stats {
+                        if let Some(pids) = pids.current {
+                            stat.pids = pids;
+                        }
+                    }
+                }
 
                 // previous docker stat from api
                 let pre_api_stat = {
@@ -416,11 +675,11 @@ impl DockerStatPollingWorker {
                         stat.cpu_usage = cpu_usage;
 
                         // get netio bps between the stats
-                        let (first_net_in, first_net_out) =
+                        let (first_net_in, first_net_out, first_pkt_in, first_pkt_out) =
                             if let Some(networks) = &pre_container_stat.networks {
                                 get_net_io(networks)
                             } else {
-                                (0, 0)
+                                (0, 0, 0, 0)
                             };
                         let (net_in_bps, net_out_bps) = (
                             if stat.net_in > first_net_in {
@@ -436,6 +695,8 @@ impl DockerStatPollingWorker {
                         );
                         stat.net_in_bps = net_in_bps * 8.;
                         stat.net_out_bps = net_out_bps * 8.;
+                        stat.net_in_packets = first_pkt_in;
+                        stat.net_out_packets = first_pkt_out;
 
                         // get blkio bps between the stats
                         let (first_blk_in, first_blk_out) =
@@ -499,11 +760,14 @@ impl DockerStatPollingWorker {
         }
     }
 
-    pub fn new(host: &str, polling_millis: u64) -> Self {
+    pub fn new(runtime: &str, namespace: &str, host: &str, polling_millis: u64) -> Self {
         Self {
-            docker_host: host.to_owned(),
-            prom_registry_prefix: Arc::new(Mutex::new("container".to_owned())),
+            runtime: runtime.to_owned(),
+            namespace: namespace.to_owned(),
+            host: host.to_owned(),
+            prom_registry_prefix: "container".to_string(),
             delay_ms: Arc::new(Mutex::new(polling_millis)),
+            containerd_channel: OnceLock::new(),
             last_stats: Arc::new(Mutex::new(LastDockerStats {
                 timestamp: SystemTime::now(),
                 stats: Vec::new(),
@@ -513,10 +777,6 @@ impl DockerStatPollingWorker {
                 stats: HashMap::new(),
             })),
         }
-    }
-
-    pub fn spawn_polling_stat_task(&self, myself: Arc<Self>) -> JoinHandle<()> {
-        tokio::spawn(async move { myself.task_handler().await })
     }
 
     pub async fn get_cgroup2_data(
@@ -540,29 +800,50 @@ impl DockerStatPollingWorker {
     }
 
     pub async fn get_last_container_stats_registry(&self) -> Registry {
-        let registry_prefix = {
-            let prefix_guard = self.prom_registry_prefix.lock().await;
-            &prefix_guard.clone()
-        };
-        let mut registry = Registry::with_prefix(registry_prefix);
+        let mut registry = Registry::with_prefix(self.prom_registry_prefix.clone());
 
         let _ = {
             let stat_guard = self.last_stats.lock().await;
             for stat in stat_guard.stats.iter() {
-                let metrics = DockerStatContainerMetrics::new(&stat.id);
+                let metrics =
+                    DockerStatContainerMetrics::new(&self.runtime, &self.namespace, &stat.id);
                 metrics.cpu_usage.set(stat.cpu_usage);
+                metrics
+                    .cpu_usage_acc
+                    .set(stat.cpu_usage_usec as f64 / 1_000_000.0);
+                metrics
+                    .cpu_user_acc
+                    .set(stat.cpu_user_usec as f64 / 1_000_000.0);
+                metrics
+                    .cpu_system_acc
+                    .set(stat.cpu_sys_usec as f64 / 1_000_000.0);
+                metrics.cpu_nr_periods.set(stat.cpu_nr_periods);
+                metrics.cpu_nr_throttled.set(stat.cpu_nr_throttled);
+                metrics
+                    .cpu_throttled_acc
+                    .set(stat.cpu_throttled_usec as f64 / 1_000_000.0);
                 metrics.mem_usage.set(stat.mem_usage);
                 metrics.mem_limit.set(stat.mem_limit);
+                metrics.mem_swap_usage.set(stat.mem_swap_usage);
+                metrics.mem_swap_limit.set(stat.mem_swap_limit);
+                metrics.mem_pgfault.set(stat.mem_pgfault);
+                metrics.mem_pgmajfault.set(stat.mem_pgmajfault);
                 metrics.net_in.set(stat.net_in);
                 metrics.net_out.set(stat.net_out);
                 metrics.net_in_bps.set(stat.net_in_bps);
                 metrics.net_out_bps.set(stat.net_out_bps);
+                metrics.net_in_packets.set(stat.net_in_packets);
+                metrics.net_out_packets.set(stat.net_out_packets);
                 metrics.blk_in.set(stat.blk_in);
                 metrics.blk_out.set(stat.blk_out);
                 metrics.blk_in_byteps.set(stat.blk_in_byteps);
                 metrics.blk_out_byteps.set(stat.blk_out_byteps);
+                metrics.blk_in_ios.set(stat.blk_in_ios);
+                metrics.blk_out_ios.set(stat.blk_out_ios);
+                metrics.pids.set(stat.pids);
 
-                metrics.register_as_sub_registry(&mut registry, &stat.name[1..]);
+                let name = stat.name.strip_prefix("/").unwrap_or(stat.name.as_str());
+                metrics.register_as_sub_registry(&mut registry, name);
             }
         };
         registry

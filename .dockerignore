@@ -1,0 +1,22 @@
+target
+.git
+.github
+Dockerfile
+docker-compose*.yml
+*.log
+tmp
+.cache
+node_modules
+
+# 如果有本地資料或測試輸出
+#data
+#dist
+#coverage
+
+# 不要排除
+!Cargo.toml
+!Cargo.lock
+!crates/**/Cargo.toml
+!crates/**/build.rs
+!src/**
+!crates/**/src/**

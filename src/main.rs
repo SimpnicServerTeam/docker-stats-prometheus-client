@@ -2,13 +2,13 @@ pub mod docker_stat_metrics;
 pub mod http_handlers;
 pub mod usecases;
 
-use std::{path::Path, sync::Arc};
+use std::{fmt::Display, panic, path::Path, sync::Arc};
 // use rayon::prelude::*;
 use actix_web::{
     App, HttpServer, middleware,
     web::{self},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use rustls::pki_types::{CertificateDer, PrivateKeyDer, pem::PemObject};
 use tracing::level_filters::LevelFilter;
 use tracing_actix_web::TracingLogger;
@@ -16,8 +16,28 @@ use tracing_subscriber::{Layer, layer::SubscriberExt};
 
 use crate::{http_handlers::SharedAppData, usecases::DockerStatPollingWorker};
 
+#[derive(Debug, Copy, Clone, PartialEq, Eq, PartialOrd, Ord, ValueEnum)]
+enum Runtime {
+    Docker,
+    Containerd,
+    Podman,
+}
+impl Display for Runtime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Runtime::Docker => "docker",
+            Runtime::Containerd => "containerd",
+            Runtime::Podman => "podman",
+        })
+    }
+}
+
 #[derive(Debug, clap::Parser)]
 struct CliArgs {
+    /// container runtime
+    #[arg(short = 'r', long = "runtime", default_value = "docker")]
+    runtime: Runtime,
+
     /// docker host
     #[arg(
         short = 'H',
@@ -50,10 +70,19 @@ struct CliArgs {
     /// verbosity output, more v for more verbose
     #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
     verbose: u8,
+
+    /// namespace of the runtime, no effects on docker
+    #[arg(long = "namespace", default_value = "default")]
+    namespace: String,
 }
 
 #[tokio::main]
 async fn main() {
+    let default_hook = panic::take_hook();
+    panic::set_hook(Box::new(move |p| {
+        default_hook(p);
+        eprintln!("{}", p);
+    }));
 
     let args = CliArgs::parse();
 
@@ -70,10 +99,15 @@ async fn main() {
     );
 
     let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(
+        args.runtime.to_string().as_str(),
+        &args.namespace,
         &args.host,
         args.polling_millis,
     ));
-    polling_stat_worker.spawn_polling_stat_task(polling_stat_worker.clone());
+    let worker_4_polling = polling_stat_worker.clone();
+    tokio::spawn(async move {
+        worker_4_polling.task_handler().await;
+    });
 
     let docker_host_4_servr = args.host.clone();
     let worker_4_server = polling_stat_worker.clone();
