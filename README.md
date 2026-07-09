@@ -1,4 +1,4 @@
-# docker-stats-exporter
+# container-stats-exporter
 
 this exporter will polling supported container host, collect stats of its containers.
 
@@ -10,7 +10,7 @@ cgroupv2-based container host
 # Usage
 
 ```
-Usage: docker-stat-exporter [OPTIONS]
+Usage: container-stats-exporter [OPTIONS]
 
 Options:
   -r, --runtime <RUNTIME>
@@ -57,7 +57,6 @@ Options:
 
   -h, --help
           Print help (see a summary with '-h')
-
 ```
 
 # Build requirements
@@ -69,9 +68,9 @@ Rust 1.88
 1. build the builder (do once)
    `docker build -t cts/rust-aarch64-linux-gnu:1.96 -f Dockerfile.toolchain .`
 2. build app
-   `docker build --platform linux/arm64 -t cts/docker-stat-exporter:latest .`
+   `docker build -f Dockerfile.app --platform linux/arm64 -t cts/container-stats-exporter:latest .`
 3. create image backup
-   `docker save cts/docker-stat-exporter:latest | xz -vvv -T 7 > docker-stat-exporter-latest.tar.xz`
+   `docker save cts/container-stats-exporter:latest | xz -vvv -T 7 > container-stats-exporter-latest.tar.xz`
 
 # Where is metrics.proto from?
 
@@ -79,26 +78,26 @@ https://github.com/containerd/cgroups/blob/main/cgroup2/stats/metrics.proto
 
 # using docker image backup file
 
-1. `docker load < docker-stat-exporter-latest.tar.xz`
+1. `docker load < container-stats-exporter-latest.tar.xz`
 2. run container with the following command
   - docker
     ```
     docker run -d \
-      --name docker-stat-exporter \
+      --name container-stats-exporter \
       -p 12096:12096 \
       -v /var/run/docker.sock:/var/run/docker.sock \
       --restart unless-stopped \
       --log-driver local \
-      cts/docker-stat-exporter:latest
+      cts/container-stats-exporter:latest
     ```
   - containerd, we need set some options to the container
     ```
     nerdctl run -d \
-      --name docker-stat-exporter \
+      --name container-stats-exporter \
       -p 12096:12096 \
       -v /var/run/containerd/containerd.sock:/var/run/containerd/containerd.sock \
       --restart unless-stopped \
-      cts/docker-stat-exporter:latest \
+      cts/container-stats-exporter:latest \
       --runtime containerd \
       --host unix:///var/run/containerd/containerd.sock
     ```

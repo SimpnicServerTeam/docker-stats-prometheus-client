@@ -541,6 +541,33 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a6ef517f0926dd24a1582492c791b6a4818a4d94e789a334894aa15b0d12f55c"
 
 [[package]]
+name = "container-stats-exporter"
+version = "0.2.0"
+dependencies = [
+ "actix-web",
+ "bollard",
+ "clap",
+ "containerd-client",
+ "futures-util",
+ "prometheus-client",
+ "prost",
+ "prost-build",
+ "prost-types",
+ "rayon",
+ "rustls",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tokio-rustls",
+ "tonic",
+ "tracing",
+ "tracing-actix-web",
+ "tracing-opentelemetry",
+ "tracing-subscriber",
+ "uuid",
+]
+
+[[package]]
 name = "containerd-client"
 version = "0.9.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -693,33 +720,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn",
-]
-
-[[package]]
-name = "docker-stat-exporter"
-version = "0.2.0"
-dependencies = [
- "actix-web",
- "bollard",
- "clap",
- "containerd-client",
- "futures-util",
- "prometheus-client",
- "prost",
- "prost-build",
- "prost-types",
- "rayon",
- "rustls",
- "serde",
- "serde_json",
- "tokio",
- "tokio-rustls",
- "tonic",
- "tracing",
- "tracing-actix-web",
- "tracing-opentelemetry",
- "tracing-subscriber",
- "uuid",
 ]
 
 [[package]]

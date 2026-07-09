@@ -1,22 +1,11 @@
-FROM --platform=$BUILDPLATFORM rust:1.96-slim AS chef
+FROM --platform=$BUILDPLATFORM cts/rust-aarch64-linux-gnu:1.96 AS chef
+ARG TARGETARCH
+ARG BUILDPLATFORM
+RUN echo "Host platform: $BUILDPLATFORM, target arch: $TARGETARCH"
+VOLUME ["/usr/app"]
 WORKDIR /usr/app
 
-ARG TARGETARCH
-RUN cargo install --locked cargo-chef
-# install dependencies for install protobuf
-RUN apt update && apt install -y --no-install-recommends wget unzip
-RUN if [ "$TARGETARCH" = "arm64" ]; then \
-      rustup target add aarch64-unknown-linux-gnu; \
-      apt install -y --no-install-recommends g++-aarch64-linux-gnu libc6-dev-arm64-cross; \
-      PROTOC_ARCH="linux-aarch_64"; \
-      export CC=aarch64-linux-gnu-gcc; \
-    else \
-      apt install -y --no-install-recommends build-essential; \
-      PROTOC_ARCH="linux-x86_64"; \
-    fi && \
-    wget -q -O protoc.zip https://github.com/protocolbuffers/protobuf/releases/download/v35.1/protoc-35.1-${PROTOC_ARCH}.zip && \
-    unzip protoc.zip -d /usr/local && rm protoc.zip
-
+# create recipe
 FROM chef AS planner
 COPY ./build.rs ./build.rs
 COPY ./src/main.rs ./src/main.rs
@@ -25,8 +14,8 @@ COPY .cargo/config.toml .cargo/config.toml
 RUN cargo chef prepare --recipe-path recipe.json
 
 FROM chef AS builder
-ENV CARGO_BUILD_JOBS=2
 ARG TARGETARCH
+RUN echo "target arch: $TARGETARCH"
 COPY --from=planner /usr/app/recipe.json recipe.json
 # Build dependencies - this is the caching Docker layer!
 RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
@@ -45,16 +34,16 @@ RUN --mount=type=cache,id=cargo-registry,target=/usr/local/cargo/registry \
     --mount=type=cache,id=cargo-git,target=/usr/local/cargo/git \
     --mount=type=cache,id=target-${TARGETARCH},target=/usr/app/target \
     if [ "$TARGETARCH" = "arm64" ]; then \
-      export CC=aarch64-linux-gnu-gcc; \
-      cargo build --release --target aarch64-unknown-linux-gnu && \
-      mv target/aarch64-unknown-linux-gnu/release/container-stats-exporter /usr/app/binary; \
+        export CC=aarch64-linux-gnu-gcc; \
+        cargo build --release --target aarch64-unknown-linux-gnu && \
+        cp target/aarch64-unknown-linux-gnu/release/container-stats-exporter /usr/app/binary; \
     else \
-      cargo build --release && \
-      mv target/release/container-stats-exporter /usr/app/binary; \
+        cargo build --release && \
+        mv target/release/container-stats-exporter /usr/app/binary; \
     fi
 
-# extract binary and build image
-FROM debian:trixie-slim AS runtime
+# extract binary
+FROM debian:trixie-slim
 WORKDIR /usr/local/sbin
 COPY --from=builder /usr/app/binary ./container-stats-exporter
-CMD ["container-stats-exporter"]
+ENTRYPOINT ["container-stats-exporter"]
