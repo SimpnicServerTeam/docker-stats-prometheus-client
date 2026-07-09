@@ -46,17 +46,28 @@ struct CliArgs {
     /// polling interval in milliseconds
     #[arg(short = 'i', long = "polling_interval", default_value_t = 2000)]
     polling_millis: u64,
+
+    /// verbosity output, more v for more verbose
+    #[arg(short = 'v', long = "verbose", action = clap::ArgAction::Count)]
+    verbose: u8,
 }
 
 #[tokio::main]
 async fn main() {
-    let stdout_log = tracing_subscriber::fmt::layer().with_filter(LevelFilter::DEBUG);
+
+    let args = CliArgs::parse();
+
+    let log_level = match args.verbose {
+        0 => LevelFilter::WARN,
+        1 => LevelFilter::INFO,
+        2 => LevelFilter::WARN,
+        _ => LevelFilter::TRACE,
+    };
+    let stdout_log = tracing_subscriber::fmt::layer().with_filter(log_level);
 
     let _ = tracing::subscriber::set_global_default(
         tracing_subscriber::Registry::default().with(stdout_log),
     );
-
-    let args = CliArgs::parse();
 
     let polling_stat_worker = Arc::new(DockerStatPollingWorker::new(
         &args.host,
