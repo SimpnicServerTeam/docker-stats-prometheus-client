@@ -675,6 +675,17 @@ impl DockerStatPollingWorker {
                                 stat.cpu_user_usec = ns / 1_000;
                             }
                         }
+                        if let Some(t) = &cpu_stats.throttling_data {
+                            if let Some(p) = t.periods {
+                                stat.cpu_nr_periods = p;
+                            }
+                            if let Some(p) = t.throttled_time {
+                                stat.cpu_nr_throttled = p;
+                            }
+                            if let Some(ns) = t.throttled_periods {
+                                stat.cpu_throttled_usec = ns / 1_000;
+                            }
+                        }
 
                         let system_cpu_usage = cpu_stats.system_cpu_usage.unwrap_or(0) as f64;
                         let total_usage = if let Some(u) = &cpu_stats.cpu_usage {
